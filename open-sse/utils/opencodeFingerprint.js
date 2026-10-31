@@ -6,10 +6,14 @@
  * - Tools: free-tier requests must declare OpenCode's own `read` and `shell`
  *   tools with their exact descriptions and parameter schemas; stubbed
  *   descriptions, renamed schemas or tool_choice "none" are answered with 403
- *   FreeTierError. Caller tools are sent untouched. A tool that already uses an
- *   exact fingerprint name with a different definition adopts OpenCode's
- *   definition in place whenever its arguments can carry them; only a genuinely
- *   different schema travels under an alias, and the response side restores
+ *   FreeTierError. Upstream also fingerprints known agent clients by their
+ *   tool-name sets and answers 429 FreeUsageLimitError, so caller tool names
+ *   that are not already all-lowercase travel under opaque aliases and are
+ *   restored on the response side. A tool whose name matches a fingerprint
+ *   name (exactly, or as a case variant such as Claude Code's `Bash`) adopts
+ *   OpenCode's definition in place whenever its required arguments can be
+ *   expressed in it; a genuinely different schema travels under an alias, and
+ *   the response side restores
  *   that caller's original name.
  * - System prompt: the CLI's `<env>` marker must be present. A request missing
  *   either half (marker or tools) answers 429 FreeUsageLimitError regardless of
@@ -17,6 +21,7 @@
  *
  * Transport is a third gate and lives in services/opencodeTlsClient.js.
  */
+import crypto from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 
@@ -149,6 +154,25 @@ function canNormalizeInPlace(tool, key) {
   return FINGERPRINT_TOOL_DEFINITIONS[key].parameters.required.every((name) => declared.includes(name));
 }
 
+/**
+ * Relaxed adoption check for CASE VARIANTS of fingerprint names (a caller's
+ * `Bash` next to OpenCode's `bash`): the wire must carry OpenCode's exact
+ * definition, so the model can only supply arguments that definition declares.
+ * Adopt whenever every REQUIRED caller argument is expressible in it — callers
+ * already treat omitted optional arguments as absent. Fails for callers whose
+ * required arguments OpenCode's schema cannot express (e.g. Claude Code's
+ * `Read` requires `file_path` while OpenCode's read takes `filePath`); those
+ * travel under an opaque alias instead.
+ */
+function canAdoptFingerprintDefinition(tool, key) {
+  const def = tool && (chatFunctionOf(tool) || tool);
+  const props = def?.parameters?.properties;
+  if (!props || typeof props !== "object" || Array.isArray(props)) return false;
+  const wanted = FINGERPRINT_TOOL_DEFINITIONS[key].parameters.properties || {};
+  const required = Array.isArray(def.parameters.required) ? def.parameters.required : [];
+  return required.every((name) => name in wanted);
+}
+
 // --- System prompt fingerprint (2026-10-30) ---------------------------------
 // The free gate validates the CLI system prompt itself: "You are opencode, an
 // interactive CLI tool..." with the <env> block inside it. A self-made system
@@ -243,11 +267,38 @@ function withFingerprintDefinition(tool, key) {
 }
 
 /**
+ * Opaque alias for a caller tool name that upstream must not see in any
+ * normalizable form. 2026-10-31 live A/B: lowercasing the caller names and
+ * mechanical suffixes (`_tool`, `_client`) still trip the gate — it evidently
+ * strips common suffixes and matches the name set case-insensitively — while
+ * names that do not derive from the originals at all pass (word variants and
+ * opaque `tool_NN` numbering both 200 through the same egress and session
+ * shape). The alias is therefore `tool_<sha1(name)>`: carries none of the
+ * original tokens, and is stable per tool name so multi-turn histories and
+ * dynamic tool-set changes keep aliasing to the same target.
+ */
+function freeAliasFor(name, taken) {
+  const hash = crypto.createHash("sha1").update(String(name).trim().toLowerCase()).digest("hex").slice(0, 8);
+  let alias = `tool_${hash}`;
+  for (let i = 2; taken.has(alias); i++) alias = `tool_${hash}_${i}`;
+  return alias;
+}
+
+/**
  * Keep caller tools on the fingerprint names whenever their arguments can carry
  * OpenCode's, and move the remaining ones off them so the exact definitions can
- * be appended without a duplicate name. Everything else, including case
- * variants such as `Read`, is preserved verbatim; upstream accepts them
- * alongside `read`.
+ * be appended without a duplicate name.
+ *
+ * 2026-10-31: upstream also fingerprints KNOWN AGENT CLIENTS by their tool
+ * names. A request carrying Claude Code's PascalCase tool set (Agent, Bash,
+ * Read, Edit, Write, AskUserQuestion, ...) is answered 429 FreeUsageLimitError
+ * no matter how faithful the rest of the fingerprint is, while the same
+ * definitions under lowercase names pass (live A/B, same egress IP and
+ * session shape). Any caller name that is not already all-lowercase is
+ * therefore aliased to a lowercase variant before the request leaves, and
+ * restored on the way back by restoreToolNames(); aliasHistoryToolCalls()
+ * keeps prior-turn calls consistent. Lowercase tool sets (opencode, shell
+ * agents) are untouched — they pass verbatim today.
  *
  * @param {Array} tools
  * @returns {{ tools: Array, map: Map<string,string> }} map: sent name -> original name
@@ -265,8 +316,43 @@ export function concealFingerprintToolNames(tools) {
       continue;
     }
 
-    const key = fingerprintToolKey(toolNameOf(tool));
+    const originalName = toolNameOf(tool);
+    const key = fingerprintToolKey(originalName);
     if (!key) {
+      // Case variant of a fingerprint name (Claude Code's `Bash` next to
+      // OpenCode's `bash`): adopt OpenCode's definition under the fingerprint
+      // spelling when the caller's required arguments can express it, so no
+      // look-alike placeholder is appended for the model to confuse with the
+      // caller's real tool, and restore the caller's spelling on responses.
+      const lowerKey = fingerprintToolKey(originalName.toLowerCase());
+      if (lowerKey) {
+        if (!seen.has(lowerKey) && !taken.has(lowerKey)
+          && canAdoptFingerprintDefinition(tool, lowerKey)) {
+          seen.add(lowerKey);
+          taken.add(lowerKey);
+          // The wire carries OpenCode's exact tool spelling and definition —
+          // the same shape the real CLI sends — and responses restore the
+          // caller's spelling via the map below.
+          out.push(withToolName(withFingerprintDefinition(tool, lowerKey), lowerKey));
+          if (originalName !== lowerKey) map.set(lowerKey, originalName);
+          continue;
+        }
+        const alias = freeAliasFor(originalName, taken);
+        taken.add(alias);
+        map.set(alias, originalName);
+        out.push(withToolName(tool, alias));
+        continue;
+      }
+      // Any other name carrying an uppercase letter: agent clients are
+      // fingerprinted upstream by their tool-name sets (2026-10-31), so
+      // conceal behind an opaque alias and keep everything else verbatim.
+      if (/[A-Z]/.test(originalName)) {
+        const alias = freeAliasFor(originalName, taken);
+        taken.add(alias);
+        map.set(alias, originalName);
+        out.push(withToolName(tool, alias));
+        continue;
+      }
       out.push(tool);
       continue;
     }
@@ -288,10 +374,12 @@ export function concealFingerprintToolNames(tools) {
       continue;
     }
 
-    let alias = `${key}_client`;
-    for (let i = 2; taken.has(alias); i++) alias = `${key}_client${i}`;
+    // The `_client` suffix normalizes back to the fingerprint name and
+    // upstream strips common suffixes when matching (2026-10-31), so use the
+    // same opaque alias scheme as every other concealed caller tool.
+    const alias = freeAliasFor(originalName, taken);
     taken.add(alias);
-    map.set(alias, key);
+    map.set(alias, originalName);
     out.push(withToolName(tool, alias));
   }
   return { tools: out, map };
